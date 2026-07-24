@@ -1,0 +1,424 @@
+# =============================================================================
+# FRL Phase 3 — onboard gesture control of a BiguaSim drone
+#
+# The ZED streams the operator's body into the world via LiveLink (engine-side).
+# The drone's own simulated camera observes it, and recognition runs onboard.
+#
+# All thresholds, gains, run metadata and calibration live here. No magic numbers
+# in code. Fields marked TODO must be calibrated on the real rig.
+# =============================================================================
+
+[run]
+run_id = "run001"               # override at launch: --run-id
+operator_id = "op01"            # override at launch: --operator-id
+motion_condition = 2            # 0 static | 1 altitude-only | 2 full  (--motion)
+mode = "full"                   # full | baseline_debounce_off  (the paper's ablation)
+lighting = "normal"             # normal | dim | bright | ... (free text)
+
+[perception]
+backend = "mediapipe"           # mediapipe | replay (replay = offline test fixture)
+
+[perception.mediapipe]
+min_detection_confidence = 0.5
+min_tracking_confidence = 0.5
+model_complexity = 2            # 0 fastest / 2 most accurate; sets recognition latency.
+                                # 2, not 1: the heavier model disambiguates limbs far
+                                # better, which is what the `land` failure needed. The
+                                # cost lands in the logged inference_time_ms.
+
+[perception.replay]
+path = "data/sample_landmarks.jsonl"
+loop = false
+
+# --- Command recognition (paper Table I vocabulary, Sec. IV-E method) --------
+[gestures]
+H = 6                           # debounce: frames a command must hold before emitting
+                                # (mode=baseline_debounce_off forces H=1). Paper Table II.
+enabled = ["go_left", "go_right", "ascend", "land", "yaw_right"]
+min_visibility = 0.35           # arms-overhead (ascend) pushes wrists near the image top,
+                                # where MediaPipe confidence falls to ~0.4; 0.5 rejected valid frames
+min_torso_height = 0.05         # normalised; below this the operator is too far away
+
+# Each arm's theta falls in one of three DISJOINT bands, and each command is a
+# distinct (left band, right band) pair:
+#     (side, down) go_left   (down, side) go_right
+#     (up,   up)   ascend    (up,   side) land   <- asymmetric, on purpose
+#     (side, side) yaw_right  <- double-biceps: both side, but elbows BENT (phi < 150)
+# No two commands can collide: an arm cannot be in two bands at once. The gaps between
+# bands (35-60 deg, 115-160 deg) are dead zones that emit no command, so a pose stays
+# unambiguous while an arm is still swinging.
+#
+# yaw_right (Table I): the double-biceps -- both arms out to the sides (side band) with the
+# elbows BENT and forearms up. It is the only side-band pose with bent elbows; the side
+# commands go_left/go_right/land all require a STRAIGHT side arm (phi >= 150), so a bent
+# side arm is otherwise rejected. (side, side) EXTENDED is the old ambiguous T-pose and
+# maps to no command. Table I note: "Yaw right -- Both arms out to the sides, elbows bent,
+# forearms up (double-biceps) -- Rotate 90 deg clockwise".
+#
+# `land` was a T-pose (side, side) and failed: MediaPipe flip-flopped the arms of the
+# bilaterally symmetric, untextured avatar and `land` scored recall 0.000 in the static
+# condition. An asymmetric pose cannot be corrupted by a left/right swap.
+[gestures.theta]                # shoulder elevation bands (degrees, image plane)
+down_max = 35.0                 # arm hanging down at the side
+side_min = 60.0                 # arm roughly horizontal
+side_max = 115.0
+up_min = 160.0                  # arm straight overhead
+
+[gestures.phi]                  # elbow flexion (degrees)
+extended_min = 150.0            # a horizontal arm must be straight to count
+
+# --- Command -> velocity [vx, vy, vz] in m/s, DRONE BODY frame, +vz = up ---
+# +vx = forward (toward the operator), +vy = the drone's right, +vz = up. flight.py
+# rotates this into the world frame by the drone's yaw before sending it, so the
+# lateral commands stay lateral no matter which way the drone is facing.
+# Signs verified on the sim: +vx -> +x, -vy -> -y, +vz -> up (at yaw 0, body == world).
+#
+# 0.5, not the old 0.4: [plant].min_command is a MEASURED 0.36, so 0.4 cleared the
+# engine's dead zone by only 0.04 m/s. Any hold term subtracted from a 0.4 gesture
+# pushed the resulting vector back under the threshold and the drone froze. 0.5 leaves
+# margin. NOTE: drone speeds therefore differ from the main-branch runs; gesture-phase
+# timing is not directly comparable with logs recorded before this change.
+[gesture_command_map]
+none       = [0.0, 0.0, 0.0]
+go_left    = [0.0, -0.5, 0.0]
+go_right   = [0.0, 0.5, 0.0]
+ascend     = [0.0, 0.0, 0.5]
+land       = [0.0, 0.0, -0.5]
+
+# --- The plant, as MEASURED (tools/characterize_plant.py) --------------------
+# `accel` is a misnomer. dynamics/base_model.py:146 hands the command straight to the
+# engine, which treats it as a first-order-lagged VELOCITY setpoint in the WORLD frame:
+#
+#     v(t) = A * (1 - e^(-t/tau)),  settling at exactly A
+#
+# So a zero command DECAYS velocity to zero over ~tau; it does not coast. Every number
+# below was measured on this build, not taken from the docs. Re-run the tool after any
+# engine or airframe change.
+[plant]
+ticks_per_sec = 30              # biguasim default (environments.py:158)
+tau_s = 1.0                     # measured 1.01 s; velocity lag toward the setpoint
+# Hard dead zone: a command whose VECTOR NORM is <= ~0.355 produces exactly zero
+# motion. Not a soft rolloff -- velocity reads 0.0000. Measured symmetric on x/y/z.
+# Consequence: a P-controller of gain k cannot settle closer than min_command/k to its
+# setpoint. That is why the old k=0.5 loops stalled 0.71 m short and never landed.
+min_command = 0.36
+# Below this desired speed, motion is unachievable, so command exactly zero rather than
+# lifting it to min_command (which would chatter). Controllers here are written to emit
+# either ~0 or >= cruise_speed, so this is a guard, not the main path.
+stop_speed = 0.05
+cruise_speed = 0.5              # the speed all approach controllers drive at
+# Deadbeat terminal approach: stopping distance after cmd -> 0 is exactly v * tau
+# (measured 0.5009 m from 0.4951 m/s). Cut the command at that range and coast on.
+arrive_tol_m = 0.12             # inside this, treat the axis as arrived and command 0
+
+# --- Simulator --------------------------------------------------------------
+[onboard]                       # scenario dict for onboard_run.py (mirrors test.py)
+package_name = "Competition"
+world = "CompetionMap"
+main_agent = "uav0"
+agent_type = "HolybroX500"      # paper Sec. IV-C airframe. Safe here because [onboard]
+                                # uses control_abstraction = "accel" (kinematic, bypasses
+                                # the attitude PID) -- the Holybro "tumbling" noted below
+                                # was a cmd_vel problem, which this platform does not use.
+# `accel`: 6-element [ax, ay, az, wx, wy, wz], world frame, m/s^2 and rad/s^2. Bypasses
+# the rotor PID entirely (base_model.py:153 returns it straight through as [v_dot,
+# w_dot]) and disables gravity, so zero command = hold position.
+#
+# Why not the velocity abstractions -- all three were measured on this build:
+#   cmd_vel / cmd_vel_yaw on DjiMatrice: from a hover the drone will NOT translate
+#     laterally. 10 s of vy=0.6 moves it <2 mm at any gain. Raising kp_att 40x makes
+#     it reach the commanded roll while body velocity stays exactly 0.000, so the
+#     constraint is engine-side, not in the controller. Lateral motion only appears
+#     while residual vertical velocity is present (a climb transient).
+#   cmd_vel / cmd_vel_yaw on HolybroX500: translates, but its attitude gains are
+#     unusable -- it wanders off during takeoff and tumbles into the ground.
+#   cmd_pos_yaw: produces no motion on any axis, not even a climb. Dead.
+# `accel` is kinematic rather than aerodynamic. That is the right trade for a paper
+# about onboard perception: it makes the drone a stable, honest camera platform, and
+# the flight dynamics are not the contribution.
+#
+# NOTE: the paragraph below is retained because the cmd_vel / cmd_pos_yaw findings still
+# hold, but the claim that `accel` "integrates acceleration" is WRONG -- it is a lagged
+# velocity setpoint with a dead zone. See [plant] and tools/characterize_plant.py.
+control_abstraction = "accel"
+# Spawn away from the operator (at the origin) with yaw 0; the standoff hold and
+# yaw_on converge onto the operator during takeoff/gesture regardless of starting
+# heading, so the spawn need not face it.
+location = [3.5, 3.2, 1.0]
+rotation = [0.0, 0.0, 0.0]
+camera_hz = 5                   # TODO(tune) higher = lower latency, more CPU
+capture_width = 512
+capture_height = 512
+max_ticks = 2000000
+# Reach this altitude (metres) before accepting gesture commands. Must sit below
+# `hold_altitude`: the altitude hold is P-only, so it settles a few cm short of target.
+takeoff_altitude = 1.7
+# Keep the operator in frame. The camera is bolted to the airframe and cannot pan or
+# tilt, so the drone itself has to hold the framing: yaw to face the operator, hold a
+# fixed standoff distance, and hold altitude. Gesture velocities are superimposed on
+# that hold -- open-loop velocity commands alone drift, lose the operator and, on the
+# HolybroX500's underdamped attitude loop, eventually tumble it into the ground.
+standoff_m = 2.2                # metres; distance to hold from the operator
+standoff_tol_m = 0.20           # metres; inside this the standoff hold commands nothing
+hold_altitude = 1.8             # metres; altitude to hold when not ascending/landing
+max_altitude = 2.6              # metres; `ascend` stops here, or the operator drops
+                                # out of the bottom of the fixed-forward camera
+
+# The station-keeping and approach loops are NOT P-controllers on velocity. The plant is
+# already a velocity servo (see [plant]), and its dead zone means a P law cannot settle:
+# inside min_command/k of the setpoint it commands a velocity the engine discards. They
+# are bang-bang instead -- drive at cruise_speed, then cut to zero one coast-length
+# (v * tau) short of the target and let the first-order decay land it on the mark.
+#
+# The heading loop stays a cascaded P-on-P (yaw error -> yaw rate -> angular accel),
+# unchanged from the committed pipeline. Stage 1 does not touch yaw.
+k_yaw = 2.0                     # P gain, heading error (rad) -> yaw rate (rad/s)
+k_yaw_rate = 4.0                # P gain, yaw-rate error -> angular acceleration (1/s)
+max_ang_accel = 4.0             # rad/s^2 cap
+# Horizontal field of view of the drone's RGBCamera, degrees. MEASURED with
+# tools/calibrate_camera_hfov.py: spawning the drone at known yaws theta and fitting the
+# operator's image-x against tan(theta) gives x = 0.56313*tan(theta) + 0.50017, R^2 =
+# 0.99999 -- a textbook pinhole, centred to within 2e-4 of frame.
+#
+# The fitted slope is POSITIVE: a drone yawed +theta sees the operator RIGHT of centre.
+# So the heading error that would re-centre the operator is the NEGATIVE of the angle
+# implied by its image-x. tracking.bearing_error_deg() carries that sign.
+camera_hfov_deg = 83.2
+camera_hfov_calibrated = true
+# Vertical FOV measured directly (tools/calibrate_camera_vfov.py): raise the drone to
+# known elevations, fit hip-midpoint image-y vs tan(alpha). R^2 = 0.9995, and vfov - hfov
+# = +1.39 deg (< 2 deg), so the 1:1 (square) render's HFOV~=VFOV assumption holds.
+camera_vfov_deg = 84.6
+camera_vfov_calibrated = true
+
+# --- The yaw study (Stage 3) -------------------------------------------------
+# The camera is bolted to the airframe and cannot pan or tilt, so keeping the operator in
+# frame is the AIRFRAME's job. This is the independent variable.
+#
+#   yaw_on   the drone rotates to keep the operator centred, driven by the bearing the
+#            tracking module reads out of its OWN camera image. Closed-loop on vision.
+#   yaw_off  the drone holds a fixed heading. The standoff hold still tracks the
+#            operator's position -- ONLY the heading is frozen -- so yaw is the single
+#            thing that differs between the conditions.
+#
+# Everything else is identical across conditions: gestures, command sequence, the `accel`
+# abstraction, the recognition pipeline, and the face_drone avatar.
+#
+# yaw_on is closed on the camera, so tracking loss is ABSORBING: once the operator leaves
+# the frame there is no bearing to steer by and the drone cannot recover. That is the
+# honest failure mode of a real fixed-camera vehicle, and it is deliberate.
+[yaw]
+mode = "yaw_on"                 # yaw_on | yaw_off  (--yaw)
+fixed_heading_deg = 0.0         # yaw_off holds this heading; 0 = the spawn rotation,
+                                # which points straight at the operator at the origin.
+# GATED, DEFAULT OFF. With recovery off, a frame with no bearing commands zero yaw rate
+# and the drone coasts. With it on, the drone sweeps toward the side the operator was
+# last seen on. Enabling it makes a THIRD condition, not a fix to yaw_on -- do not turn
+# it on and keep calling the result yaw_on. last_seen_bearing_deg is logged either way,
+# so the recovery condition can be added later without re-running anything.
+loss_recovery = false
+search_rate_deg_s = 30.0        # only used when loss_recovery = true
+
+[world.pose]
+# DynamicsSensor read-out. VERIFIED on this build: the vector is 18 floats; a drone
+# spawned at location = [-2.2, 0, 1.0] reads exactly that at [6:9], and rotation
+# [0,0,90] reads yaw = 90.0 (degrees) at [17]. test2.py's [0:2] was the wrong field.
+# Velocity at [3:6] is world-frame, and is what base_model.py:66 itself reads as 'v'.
+sensor_key = "Dynamic"
+position_indices = [6, 7, 8]
+velocity_indices = [3, 4, 5]
+rpy_indices = [15, 16, 17]
+
+# --- The landing task (Stage 1) ---------------------------------------------
+# After the gesture sequence finishes its first pass, the drone flies to one designated
+# base and descends. The gesture phase never reaches a base: the standoff hold pins the
+# drone on a circle of radius standoff_m = 2.2 m about the operator, and every base sits
+# at radius 3.0 m, so the closest approach is 0.8 m -- outside landing_radius. The land
+# phase therefore RELEASES the standoff hold and navigates on ground-truth pose.
+[mission]
+target_base = "base1"           # must name an entry in [world.platforms].bases
+# Descent setpoint, metres. Deliberately BELOW the floor: the DjiMatrice's body origin
+# comes to rest ~0.28 m up on its landing gear (measured), and the bases are drawn
+# without collision geometry, so no reachable target z exists. The drone descends until
+# the floor arrests it, and touchdown is scored as "at rest inside the landing box"
+# (see FlightController.landed) rather than "reached this altitude".
+touchdown_z = -0.5
+descent_speed = 0.5             # m/s; must exceed [plant].min_command
+z_arrive_tol_m = 0.06           # metres; vertical arrival band during descent
+land_timeout_s = 90.0           # simulated seconds in the land phase before scoring a
+                                # failure. Prevents a stalled approach hanging the run.
+takeoff_timeout_s = 30.0        # simulated seconds to reach takeoff_altitude
+approach_timeout_s = 60.0       # simulated seconds to close on the operator (within
+                                # standoff_m + standoff_tol_m) before scoring a failure
+
+[world.platforms]
+landing_radius = 0.5            # metres (xy) to count as "over the platform"
+land_z_max = 0.4                # metres above platform top still counts as landed
+# Landing bases. base1 and base_goal2 are the two Study-1 (mission_study) task bases,
+# calibrated to the confirmed arena (8x8, origin-centred); base2..base6 remain the
+# uncalibrated 6-base landing-task placeholders.
+bases = [
+  { name = "base1", pos = [3.0, -3.0, 0.0] },
+  { name = "base2", pos = [1.5, 2.6, 0.05] },
+  { name = "base3", pos = [-1.5, 2.6, 0.05] },
+  { name = "base4", pos = [-3.0, 0.0, 0.05] },
+  { name = "base5", pos = [-1.5, -2.6, 0.05] },
+  { name = "base6", pos = [1.5, -2.6, 0.05] },
+  # Second goal for the dual-goal walking-operator mission (dual_goal_mission.py) and
+  # Study-1 base 2.
+  { name = "base_goal2", pos = [-2.1, -1.5, 0.0] },
+]
+
+# The dual-goal walking-operator mission (dual_goal_mission.py): yaw_off (no yaw
+# steering), a real operator walk path instead of a static stance, and two sequential
+# TAKEOFF->APPROACH->GESTURE->LAND cycles in one mission, to base1 then base_goal2.
+[dual_goal_mission]
+goal1_base = "base1"
+goal2_base = "base_goal2"
+# Waypoints the operator walks between (there-and-back), metres, world XY.
+#
+# yaw_off means the drone NEVER turns to track the operator, and the camera HFOV is
+# only 83.2 deg (+/- 41.6 deg off boresight -- see [onboard] camera_hfov_deg). Two bugs
+# stacked on top of that narrow cone, both now fixed (see flight.py / dual_goal_mission.
+# py history for the first one -- GESTURE was snapping fixed_heading_deg back to the
+# world-0 spawn rotation instead of freezing the heading APPROACH actually achieved
+# facing the operator):
+#
+# Even after that fix, a WIDE walk loop still starves detection, because the standoff
+# hold moves the drone to follow the operator's distance but not their bearing -- so as
+# the operator swings through a big loop, the bearing from the (frozen-heading) drone to
+# the operator drifts outside the cone within seconds. Measured: a +/-25 deg / 1.3-2.6 m
+# sweep still only put the operator in frame 34/674 gesture frames.
+#
+# Even the tight ~0.4 m cluster above still broke H=6's consecutive-frame debounce for
+# ascend/land: cumulative detected frames existed inside those command windows, but
+# scattered, never 6 IN A ROW, because the operator was still slowly walking in/out of
+# best alignment. Parked essentially stationary instead (two points 1 cm apart -- the
+# walker needs >=2 to run at all) right where APPROACH leaves the drone facing them, so
+# nothing degrades alignment across a command's window and debounce can actually latch.
+walk_waypoints = [
+  [0.85, 1.15],
+  [0.86, 1.15],
+]
+walk_speed_mps = 0.05
+
+[logging]
+out_dir = "logs"
+
+# --- The rendered operator ---------------------------------------------------
+# A skinned human avatar is spawned in CompetionMap by the map's
+# BP_ZEDLivelink_Manager as soon as it sees a LiveLink animation subject. We become
+# that subject by speaking the ZED Live Link UDP protocol directly -- no ZED needed.
+# See frl_pipeline/human_source.py.
+# --- Biomechanical deviation capture (frl_pipeline/biomech_capture.py) -------
+# Measures how far a REAL operator's held pose lands from the ideal pose for each
+# command. Capture only: nothing here feeds the recognizer, and no threshold is adapted.
+#
+# The pose source is MediaPipe run on the ZED's own left RGB frame. Same estimator, same
+# `gestures.arm_features()`, so the angles are in the SAME image-plane convention and the
+# same units (DEGREES) as the recognizer. The simulator and LiveLink are not involved.
+#
+# Timing is WALL CLOCK here, not the camera-frame counter used by the missions. A real
+# human holds a pose in real seconds; the frame-counter clock exists to make the mock's
+# sequence bit-identical across conditions, which has no meaning for a live operator.
+[biomech]
+sequence = ["go_left", "go_right", "ascend", "land"]
+hold_seconds = 8.0              # how long the operator holds each command
+settle_seconds = 2.0            # frames this soon after a change are logged settled=false
+preroll_seconds = 5.0           # get-ready countdown shown before each command; not logged
+out_dir = "logs_biomech"
+
+# The IDEAL angles, in degrees. [gestures.theta] holds accept BANDS, not targets, so the
+# ideals have to be stated. These are the anatomical poses the operator is asked to hold,
+# and they match [human.mock.poses], whose shoulder deltas are exactly 0 / +-90 degrees
+# from the avatar's T-pose rest. Deviation is (measured - ideal), signed, in degrees.
+#
+# theta = upper-arm vs the downward body axis: 0 = arm hanging down, 90 = horizontal,
+# 180 = straight overhead.  phi = elbow flexion: 180 = fully extended.
+[biomech.ideal]
+theta_down = 0.0
+theta_side = 90.0
+theta_up = 180.0
+phi_extended = 180.0
+# yaw_right (double-biceps) is the only command with BENT elbows: forearms up, ~90 deg at
+# the elbow. Its ideal phi therefore is not phi_extended -- this is the anatomical target
+# the yaw_right deviation is measured against (see biomech_capture.ideal_angles).
+phi_bent = 90.0
+
+# The ZED used as a plain RGB camera: left eye only, depth off (nothing here uses it).
+# Needs the pyzed bindings, which the SDK does NOT install by default:
+#   python /usr/local/zed/get_python_api.py
+[biomech.zed]
+resolution = "HD720"            # a sl.RESOLUTION member name
+fps = 30
+
+[human]
+source = "mock"                 # mock | (zed, later)
+
+[human.livelink]
+# Endpoint from Content/NewLiveLinkPreset.uasset, auto-loaded via DefaultGame.ini's
+# DefaultLiveLinkPreset. Multicast, so the packets reach the engine on localhost.
+address = "230.0.0.1"
+port = 2000
+multicast_ttl = 2
+body_id = 1                     # LiveLink subject name; one avatar per id
+root_position = [0.0, 0.0, 0.95] # metres, Unreal world frame. z = pelvis height, so
+                                 # z=0 buries the legs; 0.95 stands the avatar on the pad.
+# How the avatar is turned. The rest facing is world +X, so root_yaw_deg = 180 faces -X.
+#   face_drone  turn to face the drone's CURRENT position, every frame (default)
+#   fixed       hold root_yaw_deg, frozen, forever
+#
+# `fixed` was the only behaviour before Stage 2, and it is a CONFOUND for the yaw study:
+# with the avatar frozen facing -X, a drone that orbits sees a side-on or rear body, and
+# MediaPipe's image-plane arm angles stop meaning anything. Recognition then collapses for
+# a reason that has nothing to do with the drone's yaw. Measured: a condition-2 mission
+# orbited ~80 deg on `go_left` and recognized nothing afterwards.
+#
+# `face_drone` removes it: a well-framed drone always sees a frontal body, so any
+# remaining recognition loss is attributable to the airframe's framing. It is also the
+# realistic case -- a human operator watches the drone they are commanding.
+# Both modes log operator_root_yaw_deg, drone_bearing_deg and view_angle_deg per frame,
+# so "operator turned away" stays separable from "operator left the frame" in the data.
+facing = "face_drone"           # face_drone | fixed
+root_yaw_deg = 180.0            # only used when facing = "fixed"
+
+[human.mock]
+# 8 s, not 4: the debouncer eats ~1.2 s of every hold, and the drone's lateral
+# velocity loop needs ~3 s to ramp up, so shorter holds barely move it.
+hold_seconds = 8.0
+sequence = ["none", "go_left", "none", "go_right", "none", "ascend", "none", "land"]
+# A pose change is not instantaneous on screen, and the debouncer needs H frames to
+# latch. Frames within this window of a pose change are logged with NO instructed
+# command, so the confusion matrix scores only settled frames.
+settle_seconds = 2.0
+
+# Per-run jitter, seeded on run_id: replicate runs must actually differ, or the std over
+# runs is a meaningless 0.000. Perturbs pose TIMING and AMPLITUDE only, never the order,
+# so the fixed command sequence is preserved across conditions.
+[human.mock.jitter]
+hold_fraction = 0.15            # each hold is scaled by 1 +/- this
+angle_degrees = 7.0             # each joint over/under-shoots by up to this many degrees
+
+# Each pose is {Body_38 joint name = [axis_x, axis_y, axis_z, degrees]}: a rotation
+# DELTA from the avatar's rest pose, in the Unreal world frame. Joints left out stay
+# at rest. Adjust here, never in code.
+#
+# The avatar's rest pose is a T-pose (arms already horizontal), and the avatar faces
+# -X, so +X is its "behind" axis. Measured against the drone camera:
+#   LEFT_SHOULDER  rot(X, +90) = that arm straight down;  rot(X, -90) = straight up
+#   RIGHT_SHOULDER rot(X, -90) = that arm straight down;  rot(X, +90) = straight up
+#   ...and 0 leaves the arm out horizontally, as in the T-pose.
+[human.mock.poses]
+# `none` = arms down at the sides: the neutral pose, no command in force.
+none     = { left_shoulder = [1.0, 0.0, 0.0, 90.0], right_shoulder = [1.0, 0.0, 0.0, -90.0] }
+go_left  = { left_shoulder = [1.0, 0.0, 0.0, 0.0],  right_shoulder = [1.0, 0.0, 0.0, -90.0] }
+go_right = { left_shoulder = [1.0, 0.0, 0.0, 90.0], right_shoulder = [1.0, 0.0, 0.0, 0.0] }
+ascend   = { left_shoulder = [1.0, 0.0, 0.0, -90.0], right_shoulder = [1.0, 0.0, 0.0, 90.0] }
+# `land`: left arm overhead, right arm horizontal. Asymmetric, so a left/right tracker
+# swap cannot turn it into another command (or into itself).
+land     = { left_shoulder = [1.0, 0.0, 0.0, -90.0], right_shoulder = [1.0, 0.0, 0.0, 0.0] }
+# `yaw_right`: double-biceps -- both arms out to the sides (horizontal) with the elbows
+# bent 90 deg and forearms UP (fists by the head). theta in the side band, phi bent (~85).
+# Symmetric, so (like ascend) a left/right tracker swap maps it onto itself.
+yaw_right = { left_shoulder = [1.0, 0.0, 0.0, 0.0], right_shoulder = [1.0, 0.0, 0.0, 0.0], left_elbow = [1.0, 0.0, 0.0, -90.0], right_elbow = [1.0, 0.0, 0.0, 90.0] }
+

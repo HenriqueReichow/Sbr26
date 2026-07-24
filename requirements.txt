@@ -1,0 +1,12 @@
+# Core pipeline: onboard perception + command recognition
+opencv-python>=4.8
+mediapipe>=0.10
+numpy>=1.24
+
+# --- Not installed via pip ---------------------------------------------------
+# BiguaSim (the drone simulator): installed from its own repository, not PyPI.
+#   See "Install BiguaSim" in README.md.
+#
+# pyzed (ZED SDK Python API): needed only to stream a real ZED camera. Install via
+# the ZED SDK's own installer, not pip:
+#   python /usr/local/zed/get_python_api.py

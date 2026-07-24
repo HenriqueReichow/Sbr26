@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local editor / assistant settings
+.claude/
+
+# Runtime logs written by the pipeline
+/logs/
+
+# The ZED Python API wheel and the BiguaSim world build are not distributed via git.
+# See README.md for how to obtain and place them.
+/pyzed-*.whl
